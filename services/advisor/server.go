@@ -103,7 +103,7 @@ func (s *advisorService) getAdvice(ctx context.Context, advisorRequest *advisorp
 		}
 
 		weatherReq := &weatherpb.WeatherRequest{Latitude: latitude, Longitude: longitude}
-		weatherResp, err := s.weatherSvc.GetCurrentWeather(ctx, weatherReq)
+		weatherResp, err := (*s.weatherSvc).GetCurrentWeather(ctx, weatherReq)
 		if err != nil {
 			advisorRequests.WithLabelValues("error").Inc()
 			return nil, fmt.Errorf("weather request failed for %s: %v", city.Location, err)
@@ -142,4 +142,91 @@ func (s *advisorService) generateAdvice(ctx context.Context, weatherData []strin
 	}
 	return advice.String(), nil
 
+}
+
+func (s *advisorService) StreamAdvice(req *advisorpb.AdvisorRequest, stream advisorpb.AdvisorService_StreamAdviceServer) error {
+	timer := prometheus.NewTimer(advisorDuration)
+	defer timer.ObserveDuration()
+
+	var weatherData, failedCities []string
+
+	for _, city := range req.Cities {
+		latitude, longitude, err := s.geocodeCity(stream.Context(), city)
+		if err != nil {
+			failedCities = append(failedCities, city.Location)
+			continue
+		}
+		weatherReq := &weatherpb.WeatherRequest{Latitude: latitude, Longitude: longitude}
+		weatherResp, err := (*s.weatherSvc).GetCurrentWeather(stream.Context(), weatherReq)
+		if err != nil {
+			failedCities = append(failedCities, fmt.Sprintf("%s (weather failed)", city.Location))
+			continue
+		}
+
+		weatherInfo := fmt.Sprintf("City: %s, Temp: %.1f°C, Condition: %s, Humidity: %d%%, Wind: %.1f m/s",
+			city.Location, weatherResp.Temperature, weatherResp.Description, weatherResp.Humidity, weatherResp.WindSpeed)
+		weatherData = append(weatherData, weatherInfo)
+	}
+	if len(weatherData) == 0 {
+		message := "i could not get any weather data for any of the cities"
+		if len(failedCities) > 0 {
+			message += fmt.Sprintf("\nFailed to get weather data for: %s", strings.Join(failedCities, ", "))
+		}
+		message += "\nPlease check the city names and try again."
+
+		err := stream.Send(&advisorpb.StreamAdviceResponse{
+			Chunk:      message,
+			IsComplete: true,
+		})
+		if err == nil {
+			advisorRequests.WithLabelValues("success").Inc()
+		} else {
+			advisorRequests.WithLabelValues("error").Inc()
+		}
+		return err
+	}
+
+	err := s.streamAdviceGeneration(stream.Context(), weatherData, stream)
+	if err != nil {
+		advisorRequests.WithLabelValues("error").Inc()
+		return fmt.Errorf("advice generation failed: %v", err)
+	}
+
+	advisorRequests.WithLabelValues("success").Inc()
+	return nil
+}
+
+func (s *advisorService) streamAdviceGeneration(ctx context.Context, weatherData []string, stream advisorpb.AdvisorService_StreamAdviceServer) error {
+	model := s.genaiClient.GenerativeModel("gemini-2.5-pro")
+	prompt := fmt.Sprintf(`Weather advisor. Based on this data provide practical advice: %s Include: summary, clothing advice, activity suggestions, warnings. Keep it concise.`, strings.Join(weatherData, "\n"))
+
+	iter := model.GenerateContentStream(ctx, genai.Text(prompt))
+
+	for {
+		resp, err := iter.Next()
+		if err != nil {
+			if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "iterator stopped") {
+
+				return stream.Send(&advisorpb.StreamAdviceResponse{
+					Chunk:      "",
+					IsComplete: true,
+				})
+			}
+			return fmt.Errorf("streaming failed: %v", err)
+		}
+
+		for _, cand := range resp.Candidates {
+			for _, part := range cand.Content.Parts {
+				if text, ok := part.(genai.Text); ok {
+					err := stream.Send(&advisorpb.StreamAdviceResponse{
+						Chunk:      string(text),
+						IsComplete: false,
+					})
+					if err != nil {
+						return fmt.Errorf("failed to send chunk: %v", err)
+					}
+				}
+			}
+		}
+	}
 }
