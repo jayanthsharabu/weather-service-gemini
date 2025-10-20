@@ -1,0 +1,58 @@
+package main
+
+import (
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"weatherservices/services/advisor"
+	"weatherservices/services/weather"
+	"weatherservices/shared/proto/advisorpb"
+	"weatherservices/shared/proto/weatherpb"
+
+	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
+)
+
+func main() {
+
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using system environment variables")
+	}
+	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
+	if geminiAPIKey == "" {
+		log.Fatal("GEMINI_API_KEY not set")
+	}
+
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("Metrics server started on port :2113")
+		log.Fatal(http.ListenAndServe(":2113", nil))
+	}()
+
+	lis, err := net.Listen("tcp", ":8082")
+	if err != nil {
+		log.Fatalf("Listen Failed: %v", err)
+	}
+
+	log.Println("grpc server starting on :8082")
+
+	s := grpc.NewServer()
+
+	weatherSvc := weather.NewWeatherService()
+	weatherpb.RegisterWeatherServiceServer(s, weatherSvc)
+
+	advisorSvc, err := advisor.NewAdvisorService(weatherSvc, geminiAPIKey)
+
+	if err != nil {
+		log.Fatalf("Advisor service failed: %v", err)
+	}
+
+	defer advisorSvc.Close()
+
+	advisorpb.RegisterAdvisorServiceServer(s, advisorSvc)
+
+	log.Println("gRPC server on :8080")
+	log.Fatal(s.Serve(lis))
+}

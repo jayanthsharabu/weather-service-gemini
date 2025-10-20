@@ -50,14 +50,14 @@ type geoCodeResponse struct {
 	} `json: "results"`
 }
 
-func NewAdvisorService(weatherSvc *weatherpb.WeatherServiceServer, geminiAPIkey string) (*advisorService, error) {
+func NewAdvisorService(weatherSvc weatherpb.WeatherServiceServer, geminiAPIkey string) (*advisorService, error) {
 	ctx := context.Background()
 	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(geminiAPIkey))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Gemini client: %v", err)
 	}
 	return &advisorService{
-		weatherSvc:  weatherSvc,
+		weatherSvc:  &weatherSvc,
 		genaiClient: genaiClient,
 	}, nil
 }
